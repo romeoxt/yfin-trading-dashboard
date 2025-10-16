@@ -30,13 +30,53 @@ class NewsAnalyzer:
             
             news_data = []
             for article in news[:limit]:
+                # Handle new Yahoo Finance API structure
+                content = article.get('content', {})
+                
+                # Extract title from content
+                title = content.get('title', 'No title')
+                
+                # Extract publisher from content.provider
+                provider = content.get('provider', {})
+                publisher = provider.get('displayName', 'Unknown')
+                
+                # Extract link from content.canonicalUrl or content.clickThroughUrl
+                link = ''
+                if 'canonicalUrl' in content and content['canonicalUrl']:
+                    link = content['canonicalUrl'].get('url', '')
+                elif 'clickThroughUrl' in content and content['clickThroughUrl']:
+                    link = content['clickThroughUrl'].get('url', '')
+                
+                # Extract published date
+                pub_date_str = content.get('pubDate', '')
+                published = datetime.now()  # Default to now
+                if pub_date_str:
+                    try:
+                        # Parse ISO format date
+                        from dateutil import parser
+                        published = parser.parse(pub_date_str)
+                        # Make timezone-naive for consistency
+                        if published.tzinfo is not None:
+                            published = published.replace(tzinfo=None)
+                    except:
+                        pass
+                
+                # Extract thumbnail
+                thumbnail = ''
+                if 'thumbnail' in content and content['thumbnail']:
+                    resolutions = content['thumbnail'].get('resolutions', [])
+                    if resolutions:
+                        thumbnail = resolutions[0].get('url', '')
+                
                 news_data.append({
-                    'title': article.get('title', 'No title'),
-                    'publisher': article.get('publisher', 'Unknown'),
-                    'link': article.get('link', ''),
-                    'published': datetime.fromtimestamp(article.get('providerPublishTime', 0)),
-                    'type': article.get('type', 'STORY'),
-                    'thumbnail': article.get('thumbnail', {}).get('resolutions', [{}])[0].get('url', '') if article.get('thumbnail') else ''
+                    'title': title,
+                    'publisher': publisher,
+                    'link': link,
+                    'published': published,
+                    'type': content.get('contentType', 'STORY'),
+                    'thumbnail': thumbnail,
+                    'summary': content.get('summary', ''),
+                    'description': content.get('description', '')
                 })
             
             return pd.DataFrame(news_data)

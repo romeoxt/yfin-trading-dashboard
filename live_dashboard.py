@@ -18,6 +18,16 @@ from backtest_engine import BacktestEngine
 from news_analyzer import NewsAnalyzer
 from sector_analyzer import SectorAnalyzer
 from paper_trading import PaperTradingEngine
+from enhanced_valuation import EnhancedValuation
+import time
+import random
+import concurrent.futures
+from dataclasses import dataclass
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("dashboard")
 
 # Page config
 st.set_page_config(
@@ -99,13 +109,272 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+# ============================================================================
+# SIGNAL CALCULATION SYSTEM
+# ============================================================================
+
+@dataclass
+class SignalParams:
+    """Parameters for signal calculation"""
+    rsi_band: tuple = (40, 60)
+    adx_thr: int = 25
+    vol_mult: float = 1.0
+    donchian_n: int = 20
+    hysteresis: int = 5
+    buy_score_thr: int = 70
+    sell_score_thr: int = 30
+    weekly_confirm: bool = True
+
+def _slope(series, n=3):
+    """Calculate slope of last n values"""
+    if series is None or len(series) < n:
+        return 0.0
+    try:
+        y = np.array(series.iloc[-n:], dtype=float)
+        x = np.arange(n, dtype=float)
+        return float(np.polyfit(x, y, 1)[0])
+    except Exception:
+        return 0.0
+
+def _weekly(df):
+    """Resample to weekly"""
+    try:
+        w = df.resample('W').last().dropna()
+        return w if len(w) >= 10 else None
+    except Exception:
+        return None
+
+def compute_signal(df: pd.DataFrame, info: dict, params: SignalParams, last_label: str = None):
+    """
+    Compute BUY/HOLD/SELL signal with scoring and explanations.
+    
+    Returns dict with:
+        - label: "BUY", "HOLD", or "SELL"
+        - score: 0-100
+        - reasons: list of explanation strings
+        - risk: dict with stop, target, atr_pct
+    """
+    out = {"label": "HOLD", "score": 50, "reasons": [], "risk": {}}
+    
+    if df is None or df.empty or len(df) < 60:
+        out["reasons"].append("Insufficient data")
+        return out
+
+    try:
+        cur = df.iloc[-1]
+        price = float(cur['Close'])
+        ma20 = float(df['MA20'].iloc[-1]) if 'MA20' in df.columns and not pd.isna(df['MA20'].iloc[-1]) else np.nan
+        ma50 = float(df['MA50'].iloc[-1]) if 'MA50' in df.columns and not pd.isna(df['MA50'].iloc[-1]) else np.nan
+        ma200 = float(df['MA200'].iloc[-1]) if 'MA200' in df.columns and not pd.isna(df['MA200'].iloc[-1]) else np.nan
+        rsi = float(df['RSI'].iloc[-1]) if 'RSI' in df.columns and not pd.isna(df['RSI'].iloc[-1]) else np.nan
+        macd = float(df['MACD'].iloc[-1]) if 'MACD' in df.columns and not pd.isna(df['MACD'].iloc[-1]) else np.nan
+        macd_sig = float(df['MACD_Signal'].iloc[-1]) if 'MACD_Signal' in df.columns and not pd.isna(df['MACD_Signal'].iloc[-1]) else np.nan
+        adx = float(df['ADX'].iloc[-1]) if 'ADX' in df.columns and not pd.isna(df['ADX'].iloc[-1]) else np.nan
+        vol = float(cur['Volume']) if 'Volume' in cur.index else np.nan
+        vol_ma = float(df['Volume_MA20'].iloc[-1]) if 'Volume_MA20' in df.columns and not pd.isna(df['Volume_MA20'].iloc[-1]) else 1.0
+        atr = float(df['ATR'].iloc[-1]) if 'ATR' in df.columns and not pd.isna(df['ATR'].iloc[-1]) else 0.0
+
+        score = 0
+        
+        # 1. REGIME FILTER - Identify trend direction
+        up = False
+        if not np.isnan(ma200) and not np.isnan(ma50):
+            up = (price > ma200) and (ma50 > ma200) and _slope(df['MA50']) > 0
+        elif not np.isnan(ma50) and not np.isnan(ma20):
+            up = (ma50 > ma20) and _slope(df['MA50']) > 0
+
+        if up:
+            score += 20
+            out["reasons"].append("[+] Uptrend regime")
+        else:
+            if _slope(df['MA50']) < 0:
+                score -= 15
+                out["reasons"].append("[-] Downtrend regime")
+            else:
+                out["reasons"].append("[~] Neutral regime")
+
+        # 2. MOMENTUM QUALITY - Prefer rising momentum
+        if not np.isnan(macd) and not np.isnan(macd_sig):
+            if (macd > macd_sig) and _slope(df['MACD']) > 0:
+                score += 15
+                out["reasons"].append("[+] MACD rising above signal")
+            elif macd < macd_sig:
+                score -= 5
+                out["reasons"].append("[-] MACD below signal")
+        
+        # 3. RSI ANALYSIS - Momentum and overbought/oversold
+        if not np.isnan(rsi):
+            if rsi >= 80:
+                score -= 15
+                out["reasons"].append("[-] RSI extremely overbought (>80)")
+            elif rsi >= 70:
+                score -= 5
+                out["reasons"].append("[!] RSI overbought (>70)")
+            elif rsi <= 20:
+                score += 10
+                out["reasons"].append("[+] RSI oversold (<20) - potential bounce")
+            elif rsi <= 30:
+                score += 5
+                out["reasons"].append("[+] RSI oversold zone (<30)")
+            elif params.rsi_band[0] <= rsi <= params.rsi_band[1]:
+                if up and _slope(df['RSI']) > 0:
+                    score += 10
+                    out["reasons"].append("[+] RSI in healthy zone & rising")
+                else:
+                    out["reasons"].append("[~] RSI in neutral zone")
+
+        # 4. VOLUME CONFIRMATION
+        if not np.isnan(vol) and vol_ma > 0:
+            vol_ok = vol > params.vol_mult * vol_ma
+            if vol_ok:
+                score += 10
+                out["reasons"].append(f"[+] Volume {vol/vol_ma:.1f}x above average")
+            else:
+                score -= 5
+                out["reasons"].append(f"[-] Weak volume ({vol/vol_ma:.1f}x avg)")
+
+        # 5. BREAKOUT/BREAKDOWN (Donchian)
+        if len(df) >= params.donchian_n:
+            h = float(df['High'].iloc[-params.donchian_n:].max())
+            l = float(df['Low'].iloc[-params.donchian_n:].min())
+            vol_ok = (not np.isnan(vol)) and (vol > params.vol_mult * vol_ma)
+            
+            if price > h and vol_ok:
+                score += 15
+                out["reasons"].append(f"[+] Breakout above {params.donchian_n}d high")
+            elif price < l:
+                score -= 15
+                out["reasons"].append(f"[-] Breakdown below {params.donchian_n}d low")
+
+        # 6. TREND STRENGTH (ADX)
+        if not np.isnan(adx):
+            if adx > params.adx_thr and _slope(df['ADX']) > 0:
+                score += 10
+                out["reasons"].append(f"[+] Strong rising trend (ADX {adx:.1f})")
+            elif adx < params.adx_thr:
+                score -= 5
+                out["reasons"].append(f"[-] Weak trend (ADX {adx:.1f} < {params.adx_thr})")
+
+        # 7. MULTI-TIMEFRAME CONFIRMATION (Weekly)
+        if params.weekly_confirm and len(df) >= 100:
+            w = _weekly(df[['Open','High','Low','Close','Volume']])
+            if w is not None and len(w) >= 20:
+                w_ma20 = w['Close'].rolling(20).mean()
+                if len(w_ma20) > 0 and _slope(w_ma20) > 0:
+                    score += 10
+                    out["reasons"].append("[+] Weekly trend confirms uptrend")
+                else:
+                    score -= 5
+                    out["reasons"].append("[-] Weekly trend not supportive")
+
+        # 8. RISK LEVELS
+        stop = float(max(cur['Low'], price - 2*atr)) if atr > 0 else float(cur['Low'])
+        tgt1 = float(price + 2*atr) if atr > 0 else float(price * 1.05)
+        out["risk"] = {
+            "atr_pct": float(atr / price * 100) if price > 0 else 0.0,
+            "stop": stop,
+            "tgt1": tgt1,
+            "reward_risk": float((tgt1 - price) / (price - stop)) if (price - stop) > 0 else 0.0
+        }
+
+        # 9. MAP SCORE TO LABEL WITH HYSTERESIS
+        label = "HOLD"
+        if score >= params.buy_score_thr:
+            label = "BUY"
+        elif score <= params.sell_score_thr:
+            label = "SELL"
+
+        # Apply hysteresis to prevent flip-flopping
+        if last_label == "BUY" and score >= (params.buy_score_thr - params.hysteresis):
+            label = "BUY"
+        if last_label == "SELL" and score <= (params.sell_score_thr + params.hysteresis):
+            label = "SELL"
+
+        out["label"] = label
+        out["score"] = int(max(0, min(100, score)))
+        
+    except Exception as e:
+        log.error(f"Error in compute_signal: {e}")
+        out["reasons"].append(f"Error: {str(e)}")
+    
+    return out
+
+def position_size_calculator(capital, risk_pct, entry, stop):
+    """Calculate position size based on risk management"""
+    risk_per_share = max(entry - stop, 0.01)
+    shares = int((capital * risk_pct / 100) / risk_per_share)
+    return {
+        'shares': shares,
+        'position_value': shares * entry,
+        'risk_amount': shares * risk_per_share,
+        'risk_pct': risk_pct
+    }
+
+# ============================================================================
+# DATA LOADING WITH RETRY AND CACHING
+# ============================================================================
+
+def _retry_with_backoff(n=3, base=0.5, jitter=0.4):
+    """Decorator for retry with exponential backoff"""
+    def decorator(fn):
+        def wrapper(*args, **kwargs):
+            for i in range(n):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    if i == n - 1:
+                        log.error(f"Failed after {n} retries: {e}")
+                        raise
+                    wait = base * (2 ** i) + random.random() * jitter
+                    log.warning(f"Retry {i+1}/{n} after {wait:.2f}s: {e}")
+                    time.sleep(wait)
+        return wrapper
+    return decorator
+
+@st.cache_data(ttl=300, max_entries=256, show_spinner=False)
+@_retry_with_backoff(n=3)
 def load_stock_data(ticker, period='6mo'):
-    """Load stock data with caching"""
-    stock = yf.Ticker(ticker)
-    df = stock.history(period=period, interval='1d')
-    info = stock.info
-    return df, info
+    """Load stock data with caching and retry logic"""
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.history(period=period, interval='1d', timeout=10)
+        
+        if df is None or df.empty:
+            log.warning(f"Empty data for {ticker}")
+            return pd.DataFrame(), {}
+        
+        # Get info separately with error handling
+        info = {}
+        try:
+            info = stock.info
+        except Exception as e:
+            log.warning(f"Could not fetch info for {ticker}: {e}")
+        
+        return df.copy(), info
+    except Exception as e:
+        log.error(f"Error loading {ticker}: {e}")
+        return pd.DataFrame(), {}
+
+def load_many_parallel(tickers, period='3mo'):
+    """Load multiple tickers in parallel"""
+    results = {}
+    
+    def load_one(ticker):
+        try:
+            df, info = load_stock_data(ticker, period)
+            return ticker, df, info
+        except Exception as e:
+            log.error(f"Failed to load {ticker}: {e}")
+            return ticker, pd.DataFrame(), {}
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(tickers))) as executor:
+        futures = {executor.submit(load_one, t): t for t in tickers}
+        
+        for future in concurrent.futures.as_completed(futures):
+            ticker, df, info = future.result()
+            results[ticker] = (df, info)
+    
+    return results
 
 @st.cache_data(ttl=60)  # Cache for 1 minute for watchlist
 def get_quick_stock_data(ticker):
@@ -436,36 +705,46 @@ def create_revenue_earnings_chart(earnings_data):
     
     fig = go.Figure()
     
+    # Determine if we should use billions or millions based on max values
+    max_revenue = df.loc['Revenue'].max() if 'Revenue' in df.index else 0
+    max_net_income = abs(df.loc['Net Income'].max()) if 'Net Income' in df.index else 0
+    max_value = max(max_revenue, max_net_income)
+    
+    use_billions = max_value >= 1e9
+    divisor = 1e9 if use_billions else 1e6
+    unit_label = 'B' if use_billions else 'M'
+    yaxis_title = f'Amount ({unit_label}illions $)'
+    
     # Revenue bars
     if 'Revenue' in df.index:
-        revenue_billions = df.loc['Revenue'].values / 1e9
+        revenue_values = df.loc['Revenue'].values / divisor
         fig.add_trace(go.Bar(
             x=quarter_labels,
-            y=revenue_billions,
-            name='Revenue (B)',
+            y=revenue_values,
+            name=f'Revenue ({unit_label})',
             marker_color='#64B5F6',
             yaxis='y',
-            hovertemplate='%{x}<br>Revenue: $%{y:.2f}B<extra></extra>'
+            hovertemplate=f'%{{x}}<br>Revenue: $%{{y:.2f}}{unit_label}<extra></extra>'
         ))
     
     # Net Income bars
     if 'Net Income' in df.index:
-        net_income_billions = df.loc['Net Income'].values / 1e9
-        colors = ['#66BB6A' if val >= 0 else '#EF5350' for val in net_income_billions]
+        net_income_values = df.loc['Net Income'].values / divisor
+        colors = ['#66BB6A' if val >= 0 else '#EF5350' for val in net_income_values]
         fig.add_trace(go.Bar(
             x=quarter_labels,
-            y=net_income_billions,
-            name='Net Income (B)',
+            y=net_income_values,
+            name=f'Net Income ({unit_label})',
             marker_color=colors,
             yaxis='y',
-            hovertemplate='%{x}<br>Net Income: $%{y:.2f}B<extra></extra>'
+            hovertemplate=f'%{{x}}<br>Net Income: $%{{y:.2f}}{unit_label}<extra></extra>'
         ))
     
     fig.update_layout(
         title='Revenue vs. Net Income',
         xaxis_title='Quarter',
         yaxis=dict(
-            title='Amount (Billions $)',
+            title=yaxis_title,
             side='left'
         ),
         height=400,
@@ -608,42 +887,32 @@ def show_watchlist_view():
         
         try:
             df, info = load_stock_data(ticker, period='3mo')
+            
+            if df.empty:
+                continue
+                
             df = calculate_all_indicators(df)
             latest = df.iloc[-1]
             prev = df.iloc[-2]
             
-            # Calculate signal
-            conditions_met = 0
-            if latest['Close'] > latest['MA20'] > latest['MA50']:
-                conditions_met += 1
-            if 40 < latest['RSI'] < 60:
-                conditions_met += 1
-            if latest['MACD'] > latest['MACD_Signal']:
-                conditions_met += 1
-            if latest['ADX'] > 25:
-                conditions_met += 1
-            if latest['Volume'] > latest['Volume_MA20']:
-                conditions_met += 1
+            # Get signal params from session state
+            params = st.session_state.get('signal_params', SignalParams())
             
-            # Smart signal logic - check for overbought conditions
-            rsi_val = latest['RSI']
-            volume_weak = latest['Volume'] < latest['Volume_MA20']
+            # Get last signal for hysteresis
+            last_lbl = watchlist.get(ticker, {}).get('_last_label') if isinstance(watchlist.get(ticker), dict) else None
             
-            if rsi_val >= 80:
-                signal = "HOLD"  # Extremely overbought
-            elif rsi_val >= 70 and volume_weak:
-                signal = "HOLD"  # Overbought with weak volume
-            elif conditions_met >= 4 and rsi_val < 70:
-                signal = "BUY"
-            elif conditions_met >= 3 and rsi_val < 70:
-                signal = "BUY"
-            elif conditions_met <= 1:
-                signal = "SELL"
-            else:
-                signal = "HOLD"
+            # Compute signal using new system
+            sig = compute_signal(df, info, params, last_label=last_lbl)
+            signal = sig["label"]
+            score = sig["score"]
+            reasons = sig["reasons"]
             
-            # Support calculation
-            support = round(df['Low'].iloc[-20:].min() * 0.99, 2)
+            # Update watchlist with last label for hysteresis
+            if isinstance(watchlist.get(ticker), dict):
+                watchlist[ticker]['_last_label'] = signal
+            
+            # Support calculation (use improved stop from signal)
+            support = sig["risk"]["stop"]
             
             # Price change
             price_change = ((latest['Close'] - prev['Close']) / prev['Close']) * 100
@@ -658,7 +927,7 @@ def show_watchlist_view():
                 'Price': f"${latest['Close']:.2f}",
                 'Change': f"{price_change:+.2f}%",
                 'Signal': signal,
-                'Score': f"{conditions_met}/5",
+                'Score': f"{score}/100",
                 'RSI': f"{latest['RSI']:.1f}",
                 'Support': f"${support:.2f}",
                 'Target (12mo)': f"${target:.2f}" if target else 'N/A',
@@ -667,7 +936,9 @@ def show_watchlist_view():
                 'Added': watchlist[ticker].get('added', 'N/A'),
                 '_price_num': latest['Close'],
                 '_change_num': price_change,
-                '_signal': signal
+                '_signal': signal,
+                '_score': score,
+                '_reasons': reasons
             })
         except Exception as e:
             st.warning(f"Could not load {ticker}: {str(e)}")
@@ -742,13 +1013,39 @@ def show_watchlist_view():
     if buy_signals:
         st.success(f"**{len(buy_signals)} stocks with BUY signals:**")
         for stock in buy_signals:
-            st.write(f"• **{stock['Ticker']}**: {stock['Price']} → Target {stock['Target']} ({stock['Upside']} upside)")
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                st.write(f"• **{stock['Ticker']}**: {stock['Price']} -> Target {stock['Target (12mo)']} ({stock['Upside']} upside)")
+            with col_b:
+                if st.button(f"Why?", key=f"why_buy_{stock['Ticker']}"):
+                    with st.expander(f"{stock['Ticker']} Signal Details", expanded=True):
+                        st.write(f"**Score: {stock['Score']}**")
+                        for reason in stock.get('_reasons', [])[:8]:
+                            st.write(reason)
     
     sell_signals = [d for d in watchlist_data if d['_signal'] == 'SELL']
     if sell_signals:
         st.error(f"**{len(sell_signals)} stocks with SELL signals:**")
         for stock in sell_signals:
-            st.write(f"• **{stock['Ticker']}**: {stock['Price']} ({stock['Change']})")
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                st.write(f"• **{stock['Ticker']}**: {stock['Price']} ({stock['Change']})")
+            with col_b:
+                if st.button(f"Why?", key=f"why_sell_{stock['Ticker']}"):
+                    with st.expander(f"{stock['Ticker']} Signal Details", expanded=True):
+                        st.write(f"**Score: {stock['Score']}**")
+                        for reason in stock.get('_reasons', [])[:8]:
+                            st.write(reason)
+    
+    # Signal reasoning details
+    st.markdown("---")
+    with st.expander("View All Signal Details", expanded=False):
+        for stock in watchlist_data:
+            st.markdown(f"### {stock['Ticker']} - {stock['Signal']} ({stock['Score']})")
+            st.caption(f"Price: {stock['Price']} | RSI: {stock['RSI']}")
+            for reason in stock.get('_reasons', []):
+                st.write(f"  {reason}")
+            st.markdown("---")
     
     # Back button at bottom
     st.markdown("---")
@@ -861,7 +1158,7 @@ def show_portfolio_view():
                 for alert in critical_alerts:
                     st.error(f"**{alert['message']}**")
                     st.caption(f"• {alert['detail']}")
-                    st.caption(f"→ {alert['action']}")
+                    st.caption(f"Action: {alert['action']}")
                     st.markdown("---")
         
         if warning_alerts:
@@ -869,7 +1166,7 @@ def show_portfolio_view():
                 for alert in warning_alerts:
                     st.warning(f"**{alert['message']}**")
                     st.caption(f"• {alert['detail']}")
-                    st.caption(f"→ {alert['action']}")
+                    st.caption(f"Action: {alert['action']}")
                     st.markdown("---")
         
         if info_alerts:
@@ -880,7 +1177,7 @@ def show_portfolio_view():
                     else:
                         st.info(f"**{alert['message']}**")
                     st.caption(f"• {alert['detail']}")
-                    st.caption(f"→ {alert['action']}")
+                    st.caption(f"Action: {alert['action']}")
                     st.markdown("---")
     
     st.markdown("---")
@@ -1612,44 +1909,29 @@ def show_comparison_view():
         with cols[i]:
             try:
                 df, info = load_stock_data(ticker, period='3mo')
+                
+                if df.empty:
+                    st.error(f"No data for {ticker}")
+                    continue
+                    
                 df = calculate_all_indicators(df)
                 latest = df.iloc[-1]
                 
-                # Calculate signal
-                conditions_met = 0
-                if latest['Close'] > latest['MA20'] > latest['MA50']:
-                    conditions_met += 1
-                if 40 < latest['RSI'] < 60:
-                    conditions_met += 1
-                if latest['MACD'] > latest['MACD_Signal']:
-                    conditions_met += 1
-                if latest['ADX'] > 25:
-                    conditions_met += 1
-                if latest['Volume'] > latest['Volume_MA20']:
-                    conditions_met += 1
+                # Get signal params from session state
+                params = st.session_state.get('signal_params', SignalParams())
                 
-                # Smart signal logic
-                rsi_val = latest['RSI']
-                volume_weak = latest['Volume'] < latest['Volume_MA20']
+                # Compute signal using new system
+                sig = compute_signal(df, info, params, last_label=None)
+                signal = sig["label"]
+                score = sig["score"]
+                reasons = sig["reasons"]
                 
-                if rsi_val >= 80:
-                    signal = "HOLD"
-                elif rsi_val >= 70 and volume_weak:
-                    signal = "HOLD"
-                elif conditions_met >= 4 and rsi_val < 70:
-                    signal = "BUY"
-                elif conditions_met >= 3 and rsi_val < 70:
-                    signal = "BUY"
-                elif conditions_met <= 1:
-                    signal = "SELL"
-                else:
-                    signal = "NEUTRAL"
                 analyst_rating = info.get('recommendationKey', 'N/A').upper()
                 
                 # Display card
                 st.markdown(f"### {ticker}")
                 st.metric("Price", f"${latest['Close']:.2f}")
-                st.metric("Score", f"{conditions_met}/5")
+                st.metric("Score", f"{score}/100")
                 
                 if signal == "BUY":
                     st.success(signal)
@@ -1662,6 +1944,7 @@ def show_comparison_view():
                 st.caption(f"RSI: {latest['RSI']:.1f}")
                 st.caption(f"ADX: {latest['ADX']:.1f}")
                 
+                upside = 0
                 if info.get('targetMeanPrice'):
                     upside = ((info['targetMeanPrice'] - latest['Close']) / latest['Close']) * 100
                     st.metric(
@@ -1670,6 +1953,12 @@ def show_comparison_view():
                         help="To 12-month analyst target"
                     )
                     st.caption(f"Target (12-mo): ${info['targetMeanPrice']:.2f}")
+                
+                # Show signal reasoning
+                with st.expander("Why this signal?", expanded=False):
+                    for reason in reasons[:6]:
+                        st.write(f"• {reason}")
+                    st.caption(f"Stop: ${sig['risk']['stop']:.2f} | Target: ${sig['risk']['tgt1']:.2f}")
                 
                 if st.button(f"Analyze {ticker}", key=f"analyze_{ticker}"):
                     st.session_state['current_ticker'] = ticker
@@ -1680,9 +1969,9 @@ def show_comparison_view():
                     'ticker': ticker,
                     'price': latest['Close'],
                     'signal': signal,
-                    'score': conditions_met,
+                    'score': score,
                     'rsi': latest['RSI'],
-                    'upside': upside if info.get('targetMeanPrice') else 0
+                    'upside': upside
                 })
                 
             except Exception as e:
@@ -1780,7 +2069,7 @@ def main():
             st.session_state['watchlist'] = watchlist
             with open(WATCHLIST_FILE, 'w') as f:
                 json.dump(watchlist, f, indent=2)
-            st.sidebar.success(f"✓ Added {ticker_input}")
+            st.sidebar.success(f"Added {ticker_input}")
         elif ticker_input in watchlist:
             st.sidebar.info(f"{ticker_input} already saved")
     
@@ -1973,6 +2262,105 @@ def main():
     if auto_refresh:
         st.sidebar.info("Dashboard will refresh every 5 minutes")
     
+    # Signal Settings
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Signal Settings")
+    
+    with st.sidebar.expander("Customize Thresholds", expanded=False):
+        rsi_lo, rsi_hi = st.slider(
+            "RSI Band", 
+            10, 90, (40, 60),
+            help="RSI range considered healthy for entries"
+        )
+        adx_thr = st.slider(
+            "ADX Threshold", 
+            10, 50, 25,
+            help="Minimum ADX for strong trend confirmation"
+        )
+        vol_mult = st.slider(
+            "Volume Multiple", 
+            0.5, 2.0, 1.0, 0.1,
+            help="Required volume vs 20-day average"
+        )
+        use_weekly = st.checkbox(
+            "Weekly Trend Confirmation", 
+            value=True,
+            help="Require weekly chart to confirm uptrend"
+        )
+        buy_threshold = st.slider(
+            "Buy Score Threshold",
+            50, 90, 70,
+            help="Minimum score to generate BUY signal"
+        )
+        sell_threshold = st.slider(
+            "Sell Score Threshold",
+            10, 50, 30,
+            help="Maximum score to generate SELL signal"
+        )
+    
+    # Create signal params from user settings
+    signal_params = SignalParams(
+        rsi_band=(rsi_lo, rsi_hi),
+        adx_thr=adx_thr,
+        vol_mult=vol_mult,
+        weekly_confirm=use_weekly,
+        buy_score_thr=buy_threshold,
+        sell_score_thr=sell_threshold,
+    )
+    
+    # Store in session state for access in views
+    st.session_state['signal_params'] = signal_params
+    
+    # Alerts Section
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Price Alerts")
+    
+    with st.sidebar.expander("Set Alert Conditions", expanded=False):
+        enable_alerts = st.checkbox("Enable Alerts", value=False, key="enable_alerts")
+        
+        if enable_alerts:
+            alert_type = st.selectbox(
+                "Alert Type",
+                ["Price Above", "Price Below", "RSI Overbought (>70)", "RSI Oversold (<30)", "Volume Spike (>2x avg)"],
+                key="alert_type"
+            )
+            
+            if alert_type in ["Price Above", "Price Below"]:
+                alert_price = st.number_input(
+                    "Alert Price ($)",
+                    min_value=0.01,
+                    value=100.0,
+                    step=0.01,
+                    key="alert_price"
+                )
+            
+            # Store alerts in session state
+            if 'alerts' not in st.session_state:
+                st.session_state['alerts'] = []
+            
+            if st.button("Add Alert", key="add_alert"):
+                alert = {
+                    'ticker': ticker_input,
+                    'type': alert_type,
+                    'price': alert_price if alert_type in ["Price Above", "Price Below"] else None,
+                    'active': True
+                }
+                st.session_state['alerts'].append(alert)
+                st.success(f"Alert added for {ticker_input}")
+            
+            # Show active alerts
+            if st.session_state.get('alerts'):
+                st.markdown("**Active Alerts:**")
+                for i, alert in enumerate(st.session_state['alerts']):
+                    if alert['active']:
+                        if alert['price']:
+                            st.caption(f"• {alert['ticker']}: {alert['type']} ${alert['price']:.2f}")
+                        else:
+                            st.caption(f"• {alert['ticker']}: {alert['type']}")
+                        if st.button(f"Remove", key=f"remove_alert_{i}"):
+                            st.session_state['alerts'][i]['active'] = False
+                            st.rerun()
+    
     # Check if showing watchlist view
     if st.session_state.get('show_watchlist', False):
         show_watchlist_view()
@@ -2007,6 +2395,29 @@ def main():
         # Current stats
         current = df.iloc[-1]
         prev = df.iloc[-2]
+        
+        # Check alerts
+        if st.session_state.get('alerts'):
+            triggered_alerts = []
+            for alert in st.session_state['alerts']:
+                if not alert['active'] or alert['ticker'] != ticker_input:
+                    continue
+                
+                alert_triggered = False
+                if alert['type'] == "Price Above" and current['Close'] > alert['price']:
+                    triggered_alerts.append(f"ALERT: {alert['ticker']} is above ${alert['price']:.2f} (Current: ${current['Close']:.2f})")
+                elif alert['type'] == "Price Below" and current['Close'] < alert['price']:
+                    triggered_alerts.append(f"ALERT: {alert['ticker']} is below ${alert['price']:.2f} (Current: ${current['Close']:.2f})")
+                elif alert['type'] == "RSI Overbought (>70)" and current['RSI'] > 70:
+                    triggered_alerts.append(f"ALERT: {alert['ticker']} RSI is overbought: {current['RSI']:.1f}")
+                elif alert['type'] == "RSI Oversold (<30)" and current['RSI'] < 30:
+                    triggered_alerts.append(f"ALERT: {alert['ticker']} RSI is oversold: {current['RSI']:.1f}")
+                elif alert['type'] == "Volume Spike (>2x avg)" and current['Volume'] > 2 * current['Volume_MA20']:
+                    triggered_alerts.append(f"ALERT: {alert['ticker']} volume spike: {current['Volume']/current['Volume_MA20']:.1f}x average")
+            
+            if triggered_alerts:
+                for alert_msg in triggered_alerts:
+                    st.warning(alert_msg)
         
         # Top metrics
         col1, col2, col3, col4, col5 = st.columns(5)
@@ -2119,8 +2530,16 @@ def main():
                     else:
                         st.metric("P/E Ratio", f"{pe_val:.2f}", "Normal")
         
-        # Get trading signal early for comparison
-        signal, color, score, conditions = get_trading_signal(df)
+        # Get trading signal using new improved system
+        params = st.session_state.get('signal_params', SignalParams())
+        sig = compute_signal(df, info, params, last_label=None)
+        signal = sig["label"]
+        score = sig["score"]
+        reasons = sig["reasons"]
+        risk_info = sig["risk"]
+        
+        # Map signal to color for backward compatibility
+        color = "green" if signal == "BUY" else ("red" if signal == "SELL" else "orange")
         
         # Get current data for specific guidance
         latest = df.iloc[-1]
@@ -2245,13 +2664,26 @@ def main():
             st.markdown("**(Short-term: Days to weeks)**")
             if tech_bullish:
                 st.markdown(f"### :green[{signal}]")
-                st.caption(f"Chart shows bullish setup ({score}/5)")
+                st.caption(f"Score: {score}/100 (Bullish)")
             elif tech_bearish:
                 st.markdown(f"### :red[{signal}]")
-                st.caption(f"Chart shows weak momentum ({score}/5)")
+                st.caption(f"Score: {score}/100 (Bearish)")
             else:
                 st.markdown(f"### :orange[{signal}]")
-                st.caption(f"Chart is neutral ({score}/5)")
+                st.caption(f"Score: {score}/100 (Neutral)")
+            
+            # Show signal reasoning
+            with st.expander("Why this signal?", expanded=False):
+                st.markdown("**Signal Factors:**")
+                for reason in reasons[:10]:
+                    st.write(reason)
+                st.markdown("---")
+                st.caption(f"**Risk Management:**")
+                st.caption(f"Stop Loss: ${risk_info['stop']:.2f}")
+                st.caption(f"First Target: ${risk_info['tgt1']:.2f}")
+                st.caption(f"ATR: {risk_info['atr_pct']:.2f}%")
+                if risk_info['reward_risk'] > 0:
+                    st.caption(f"Reward/Risk: {risk_info['reward_risk']:.2f}:1")
         
         with col_comp3:
             st.markdown("### What This Means")
@@ -2307,7 +2739,7 @@ def main():
                     momentum_triggers.append(f"• MACD crosses above signal line")
                 
                 if rsi < 40:
-                    momentum_triggers.append(f"• RSI bounces from oversold ({rsi:.1f} → 40+)")
+                    momentum_triggers.append(f"• RSI bounces from oversold ({rsi:.1f} to 40+)")
                 elif rsi > 60:
                     momentum_triggers.append(f"• RSI cools to 40-50 (currently {rsi:.1f})")
                 else:
@@ -2395,6 +2827,74 @@ def main():
                 st.write(f"• Analyst rating to change")
                 st.write(f"• Technical conditions to align")
                 st.write(f"• Better opportunity elsewhere")
+        
+        # Position Sizing Calculator
+        st.markdown("---")
+        st.subheader("Position Sizing Calculator")
+        
+        with st.expander("Calculate Position Size", expanded=False):
+            st.markdown("**Risk Management Tool** - Calculate how many shares to buy based on your risk tolerance")
+            
+            col_ps1, col_ps2, col_ps3 = st.columns(3)
+            
+            with col_ps1:
+                portfolio_capital = st.number_input(
+                    "Portfolio Value ($)",
+                    min_value=100.0,
+                    value=10000.0,
+                    step=100.0,
+                    help="Total capital available for trading"
+                )
+                risk_pct = st.slider(
+                    "Risk per Trade (%)",
+                    min_value=0.5,
+                    max_value=5.0,
+                    value=2.0,
+                    step=0.5,
+                    help="% of portfolio you're willing to risk on this trade (2% is common)"
+                )
+            
+            with col_ps2:
+                entry_price = st.number_input(
+                    "Entry Price ($)",
+                    min_value=0.01,
+                    value=float(current_price),
+                    step=0.01,
+                    help="Price you plan to enter at"
+                )
+                stop_price = st.number_input(
+                    "Stop Loss ($)",
+                    min_value=0.01,
+                    value=float(risk_info['stop']),
+                    step=0.01,
+                    help="Price at which you'll exit to limit losses"
+                )
+            
+            with col_ps3:
+                # Calculate position
+                pos_calc = position_size_calculator(portfolio_capital, risk_pct, entry_price, stop_price)
+                
+                st.metric("Shares to Buy", f"{pos_calc['shares']:,}")
+                st.metric("Position Value", f"${pos_calc['position_value']:,.2f}")
+                st.metric("$ at Risk", f"${pos_calc['risk_amount']:.2f}")
+                
+                # Risk/Reward if target set
+                if info.get('targetMeanPrice'):
+                    target_price = info['targetMeanPrice']
+                    potential_gain = (target_price - entry_price) * pos_calc['shares']
+                    rr_ratio = potential_gain / pos_calc['risk_amount'] if pos_calc['risk_amount'] > 0 else 0
+                    st.metric("Reward/Risk", f"{rr_ratio:.2f}:1")
+                    st.caption(f"Potential gain to analyst target: ${potential_gain:,.2f}")
+            
+            # Add explanation
+            st.markdown("---")
+            st.info(f"""
+            **How it works:**
+            - You're risking **{risk_pct}%** of your ${portfolio_capital:,.0f} portfolio = **${portfolio_capital * risk_pct / 100:,.2f}**
+            - Risk per share: ${entry_price - stop_price:.2f} (entry - stop)
+            - Shares: ${portfolio_capital * risk_pct / 100:,.2f} ÷ ${entry_price - stop_price:.2f} = **{pos_calc['shares']} shares**
+            - If stopped out, you lose ${pos_calc['risk_amount']:.2f} ({risk_pct}% of portfolio)
+            """)
         
         # Earnings Analysis Section
         st.markdown("---")
@@ -2505,10 +3005,18 @@ def main():
                     
                     with col_rev1:
                         if 'totalRevenue' in info and info['totalRevenue']:
-                            st.metric(
-                                "Total Revenue",
-                                f"${info['totalRevenue']/1e9:.2f}B"
-                            )
+                            # Use same logic as chart - millions unless over 1B
+                            revenue = info['totalRevenue']
+                            if revenue >= 1e9:
+                                st.metric(
+                                    "Total Revenue",
+                                    f"${revenue/1e9:.2f}B"
+                                )
+                            else:
+                                st.metric(
+                                    "Total Revenue",
+                                    f"${revenue/1e6:.2f}M"
+                                )
                     
                     with col_rev2:
                         if 'revenueGrowth' in info and info['revenueGrowth']:
@@ -2530,10 +3038,249 @@ def main():
             st.warning(f"Could not load earnings data: {str(e)}")
             st.info("Some tickers may not have complete earnings data available")
         
+        # Enhanced Valuation Analysis Section
+        st.markdown("---")
+        st.subheader("Valuation Analysis")
+        st.caption("Multi-factor valuation using DCF, P/S analysis, and fundamental scoring")
+        
+        try:
+            with st.spinner('Analyzing valuation...'):
+                val_analyzer = EnhancedValuation(ticker_input)
+                valuation = val_analyzer.get_comprehensive_valuation()
+            
+            # Overall valuation status banner
+            overall_status = valuation['overall_status']
+            if overall_status == 'OVERVALUED':
+                st.error(f"**{overall_status}** - Stock appears expensive relative to fundamentals")
+            elif overall_status == 'UNDERVALUED':
+                st.success(f"**{overall_status}** - Stock may be trading below fair value")
+            elif overall_status == 'FAIR_VALUE':
+                st.info(f"**{overall_status}** - Mixed signals, stock appears fairly valued")
+            else:
+                st.warning(f"**{overall_status}** - Insufficient data for valuation")
+            
+            # Create tabs for different valuation methods
+            val_tab1, val_tab2, val_tab3 = st.tabs(["DCF Analysis", "P/S Ratio", "Valuation Score"])
+            
+            # TAB 1: DCF Analysis
+            with val_tab1:
+                dcf = valuation['dcf']
+                if dcf:
+                    st.markdown("### Discounted Cash Flow (DCF)")
+                    st.caption("Estimates intrinsic value by projecting future cash flows")
+                    
+                    col_dcf1, col_dcf2, col_dcf3 = st.columns(3)
+                    
+                    with col_dcf1:
+                        st.metric(
+                            "DCF Fair Value",
+                            f"${abs(dcf['dcf_per_share']):.2f}",
+                            help="Estimated intrinsic value per share"
+                        )
+                    
+                    with col_dcf2:
+                        st.metric(
+                            "Current Price",
+                            f"${dcf['current_price']:.2f}"
+                        )
+                    
+                    with col_dcf3:
+                        over_pct = dcf['overvaluation_pct']
+                        delta_color = "inverse" if over_pct > 0 else "normal"
+                        st.metric(
+                            "Valuation Gap",
+                            f"{abs(over_pct):.1f}%",
+                            delta=dcf['valuation_status'],
+                            delta_color=delta_color,
+                            help="Positive = overvalued, Negative = undervalued"
+                        )
+                    
+                    # Explanation
+                    st.markdown("---")
+                    if dcf['valuation_status'] == 'OVERVALUED':
+                        st.warning(f"""
+                        **DCF Analysis suggests OVERVALUATION**
+                        
+                        The current market price (${dcf['current_price']:.2f}) is trading **{abs(dcf['overvaluation_pct']):.1f}% above** 
+                        the estimated fair value (${abs(dcf['dcf_per_share']):.2f}) based on projected cash flows.
+                        
+                        This may indicate the market has priced in very optimistic growth expectations.
+                        """)
+                    else:
+                        st.success(f"""
+                        **DCF Analysis suggests UNDERVALUATION**
+                        
+                        The current market price (${dcf['current_price']:.2f}) is trading **{abs(dcf['overvaluation_pct']):.1f}% below** 
+                        the estimated fair value (${abs(dcf['dcf_per_share']):.2f}) based on projected cash flows.
+                        
+                        This may represent a buying opportunity if fundamentals are sound.
+                        """)
+                    
+                    # Current FCF
+                    fcf_millions = dcf['current_fcf'] / 1e6
+                    if fcf_millions < 0:
+                        st.info(f"**Current Free Cash Flow:** ${abs(fcf_millions):.1f}M (negative) - Typical for growth-stage biotech investing heavily in R&D")
+                    else:
+                        st.success(f"**Current Free Cash Flow:** ${fcf_millions:.1f}M (positive) - Company generating cash")
+                
+                else:
+                    st.info("DCF analysis not available - insufficient cash flow data")
+            
+            # TAB 2: P/S Analysis
+            with val_tab2:
+                ps = valuation['ps_analysis']
+                if ps:
+                    st.markdown("### Price-to-Sales (P/S) Ratio Analysis")
+                    st.caption("Compares valuation to revenue - useful for unprofitable growth companies")
+                    
+                    col_ps1, col_ps2, col_ps3 = st.columns(3)
+                    
+                    with col_ps1:
+                        ps_color = "inverse" if ps['ps_ratio'] > ps['industry_avg'] else "normal"
+                        st.metric(
+                            f"{ticker_input} P/S",
+                            f"{ps['ps_ratio']:.1f}x",
+                            delta=f"vs {ps['industry_avg']:.1f}x industry",
+                            delta_color=ps_color
+                        )
+                    
+                    with col_ps2:
+                        st.metric(
+                            "Industry Avg",
+                            f"{ps['industry_avg']:.1f}x",
+                            help="Biotech industry average P/S ratio"
+                        )
+                    
+                    with col_ps3:
+                        st.metric(
+                            "Peer Avg",
+                            f"{ps['peer_avg']:.1f}x",
+                            help="Peer group average P/S ratio"
+                        )
+                    
+                    # Visualization
+                    st.markdown("---")
+                    import plotly.graph_objects as go
+                    
+                    fig_ps = go.Figure(go.Bar(
+                        x=['Industry Avg', 'Peer Avg', ticker_input],
+                        y=[ps['industry_avg'], ps['peer_avg'], ps['ps_ratio']],
+                        marker_color=['#64B5F6', '#81C784', '#EF5350' if ps['is_overvalued'] else '#66BB6A'],
+                        text=[f"{ps['industry_avg']:.1f}x", f"{ps['peer_avg']:.1f}x", f"{ps['ps_ratio']:.1f}x"],
+                        textposition='outside'
+                    ))
+                    
+                    fig_ps.update_layout(
+                        title='P/S Ratio Comparison',
+                        yaxis_title='P/S Ratio (x)',
+                        height=350,
+                        showlegend=False
+                    )
+                    
+                    st.plotly_chart(fig_ps, use_container_width=True)
+                    
+                    # Explanation
+                    if ps['is_overvalued']:
+                        st.warning(f"""
+                        **P/S Analysis suggests OVERVALUATION**
+                        
+                        {ticker_input}'s P/S ratio of **{ps['ps_ratio']:.1f}x** is significantly higher than:
+                        - Industry average: {ps['industry_avg']:.1f}x
+                        - Peer average: {ps['peer_avg']:.1f}x
+                        
+                        Investors are paying a premium for each dollar of revenue, which may be justified 
+                        by superior growth prospects or margins.
+                        """)
+                    else:
+                        st.success(f"""
+                        **P/S Analysis suggests FAIR/UNDERVALUATION**
+                        
+                        {ticker_input}'s P/S ratio of **{ps['ps_ratio']:.1f}x** is in line with or below:
+                        - Industry average: {ps['industry_avg']:.1f}x
+                        - Peer average: {ps['peer_avg']:.1f}x
+                        
+                        The stock appears reasonably valued relative to its revenue.
+                        """)
+                
+                else:
+                    st.info("P/S analysis not available - insufficient revenue data")
+            
+            # TAB 3: Valuation Score
+            with val_tab3:
+                score_data = valuation['valuation_score']
+                
+                st.markdown("### Multi-Factor Valuation Score")
+                st.caption("Comprehensive scoring across 6 fundamental factors")
+                
+                # Score display
+                col_score1, col_score2 = st.columns([1, 2])
+                
+                with col_score1:
+                    score_pct = (score_data['score'] / score_data['max_score']) * 100
+                    
+                    st.markdown(f"## {score_data['score']}/{score_data['max_score']}")
+                    st.markdown(f"### Grade: **{score_data['grade']}**")
+                    
+                    # Progress bar
+                    st.progress(score_pct / 100)
+                
+                with col_score2:
+                    st.markdown("**Valuation Factors:**")
+                    for factor in score_data['factors']:
+                        if '✓' in factor:
+                            st.markdown(f"- PASS: {factor.replace('✓ ', '')}")
+                        else:
+                            st.markdown(f"- FAIL: {factor.replace('✗ ', '')}")
+                
+                # Interpretation
+                st.markdown("---")
+                if score_data['score'] >= 5:
+                    st.success("""
+                    **Excellent Fundamentals** (Grade A)
+                    
+                    This stock checks most valuation boxes. Strong fundamentals suggest it may be undervalued 
+                    or fairly priced. However, always consider growth prospects and industry context.
+                    """)
+                elif score_data['score'] >= 4:
+                    st.success("""
+                    **Good Fundamentals** (Grade B)
+                    
+                    This stock has solid fundamentals with room for improvement. Generally a positive sign 
+                    for long-term value investors.
+                    """)
+                elif score_data['score'] >= 3:
+                    st.info("""
+                    **Mixed Fundamentals** (Grade C)
+                    
+                    This stock shows average fundamentals. Some strengths, some weaknesses. Requires deeper 
+                    analysis to determine if it's a good fit for your strategy.
+                    """)
+                else:
+                    st.warning("""
+                    **Weak Fundamentals** (Grade D/F)
+                    
+                    This stock fails most valuation checks. Common for early-stage growth companies, 
+                    especially in biotech. High risk, high potential reward scenario.
+                    """)
+                
+                # Factor explanations
+                with st.expander("What do these factors mean?"):
+                    st.markdown("""
+                    **P/E Ratio** - Price relative to earnings (PASS if < 15)  
+                    **P/S Ratio** - Price relative to sales vs industry (PASS if below average)  
+                    **Debt-to-Equity** - Financial leverage (PASS if < 0.5)  
+                    **Current Ratio** - Short-term liquidity (PASS if > 2)  
+                    **Revenue Growth** - Top-line growth (PASS if > 10%)  
+                    **Profitability** - Profit margins (PASS if > 10%)  
+                    """)
+        
+        except Exception as e:
+            st.warning(f"Could not load valuation analysis: {str(e)}")
+            st.info("Valuation analysis may not be available for all tickers")
+        
         # News & Sentiment Section
         st.markdown("---")
         st.subheader("News & Sentiment Analysis")
-        
         try:
             with st.spinner('Loading news...'):
                 news_analyzer = NewsAnalyzer(ticker_input)
@@ -2599,7 +3346,10 @@ def main():
                 st.info("No recent news found for this ticker")
         
         except Exception as e:
-            st.warning(f"Could not load news: {str(e)}")
+            st.error(f"Could not load news: {str(e)}")
+            st.write(f"Error type: {type(e).__name__}")
+            import traceback
+            st.code(traceback.format_exc())
         
         # Sector Analysis Section
         st.markdown("---")
@@ -2703,92 +3453,62 @@ def main():
             else:
                 st.markdown(f'<p class="neutral-signal">Signal: {signal}</p>', unsafe_allow_html=True)
             
-            st.write(f"**Score: {score}/5 conditions met**")
+            st.write(f"**Score: {score}/100**")
         
         with col_signal2:
-            st.write("**Condition Breakdown:**")
-            for name, details in conditions.items():
-                status = "PASS" if details['passed'] else "FAIL"
-                status_color = "green" if details['passed'] else "red"
-                
-                # Create a styled container for each condition
-                with st.container():
-                    col_status, col_detail = st.columns([1, 4])
-                    with col_status:
-                        if details['passed']:
-                            st.markdown(f"**:green[✓ PASS]**")
-                        else:
-                            st.markdown(f"**:red[✗ FAIL]**")
-                    with col_detail:
-                        st.markdown(f"**{name}**")
-                        st.markdown(f"*{details['explanation']}*")
-                        st.caption(f"{details['value']}")
-                    st.markdown("---")
+            st.write("**Signal Analysis:**")
             
-            # Add contextual explanation based on what's causing the signal
-            if "OVERBOUGHT" in signal or (signal == "HOLD / CAUTION" and latest['RSI'] >= 70):
-                st.warning(f"""
-                    **Why HOLD instead of BUY?**
+            # Show reasons from new signal system
+            for reason in reasons[:8]:
+                if reason.startswith("[+]"):
+                    st.markdown(f":green[{reason}]")
+                elif reason.startswith("[-]"):
+                    st.markdown(f":red[{reason}]")
+                else:
+                    st.markdown(f":orange[{reason}]")
+            
+            st.markdown("---")
+            
+            # Add contextual explanation based on signal and score
+            if signal == "BUY" and score >= 70:
+                st.success(f"""
+                    **Strong Buy Opportunity**
                     
-                    Even though {score}/5 conditions are met, RSI is extremely overbought ({latest['RSI']:.1f}). 
-                    This is a major red flag that overrides the score.
+                    Score: {score}/100 - Multiple confirming signals
                     
-                    **What this means:**
-                    - Stock may be due for a pullback/correction
-                    - Wait for RSI to cool off below 70
-                    - Or wait for a dip to better support levels
-                    
-                    **Risk:** Buying at extreme overbought = high chance of short-term losses
+                    **Why BUY?** Technical indicators show bullish momentum with healthy conditions.
                 """)
-            elif signal in ["HOLD", "NEUTRAL / HOLD"] and score == 4:
-                # 4/5 but not quite BUY (likely due to RSI being slightly off)
-                failed_conditions = [name for name, details in conditions.items() if not details['passed']]
+            elif signal == "BUY":
                 st.info(f"""
-                    **Strong Setup with Minor Concerns**
+                    **Decent Buy Setup**
                     
-                    {score}/5 conditions met - very close to a buy signal!
+                    Score: {score}/100
                     
-                    **What's missing:** {', '.join(failed_conditions)}
-                    
-                    **Action:** Monitor for improvement. If {failed_conditions[0]} improves, this could be a strong entry.
+                    **Why BUY?** Core trend and momentum are positive.
                 """)
-            elif signal in ["HOLD", "NEUTRAL / HOLD"] and score <= 2:
-                # Weak setup - explain what's wrong
-                failed_conditions = [name for name, details in conditions.items() if not details['passed']]
-                passed_conditions = [name for name, details in conditions.items() if details['passed']]
+            elif signal == "HOLD" and score >= 50:
+                st.warning(f"""
+                    **Mixed Signals - HOLD**
+                    
+                    Score: {score}/100 - Neither strongly bullish nor bearish
+                    
+                    **Action:** Wait for clearer trend.
+                """)
+            elif signal == "HOLD":
+                st.warning(f"""
+                    **Weak Setup - HOLD**
+                    
+                    Score: {score}/100
+                    
+                    **Action:** Monitor for improvement.
+                """)
+            elif signal == "SELL":
                 st.error(f"""
-                    **Weak Setup - Not Ready**
+                    **Bearish Signal - SELL**
                     
-                    Only {score}/5 conditions met. Too many red flags.
+                    Score: {score}/100
                     
-                    **Passing:** {', '.join(passed_conditions) if passed_conditions else 'None'}
-                    **Failing:** {', '.join(failed_conditions)}
-                    
-                    **Action:** Wait for more conditions to align before considering entry.
-                """)
-            elif signal in ["STRONG BUY", "BUY"] and score == 3:
-                # 3/5 but got BUY (RSI is healthy)
-                failed_conditions = [name for name, details in conditions.items() if not details['passed']]
-                st.success(f"""
-                    **Decent Opportunity**
-                    
-                    {score}/5 conditions met with healthy RSI ({latest['RSI']:.1f}).
-                    
-                    **What's not perfect:** {', '.join(failed_conditions)}
-                    
-                    **Why still BUY?** Core trend and momentum are solid. The failing conditions are less critical.
-                """)
-            elif signal in ["STRONG BUY", "BUY"] and score == 4:
-                # 4/5 - very strong
-                failed_conditions = [name for name, details in conditions.items() if not details['passed']]
-                st.success(f"""
-                    **Excellent Setup!**
-                    
-                    {score}/5 conditions met - strong alignment across indicators.
-                    
-                    **Only missing:** {', '.join(failed_conditions)}
-                    
-                    **Confidence:** High. This is a solid entry point.
+                    **Action:** Avoid new entries.
                 """)
         
         # Main chart
